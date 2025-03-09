@@ -128,7 +128,7 @@ class WanV2V:
 
     def get_video_frames(self, input_video_path, video_length, h, w, fps=None):
         """
-        读取视频文件并提取帧
+        读取视频文件并提取帧，并根据VAE的时间压缩比调整帧数
         
         Args:
             input_video_path (str): 输入视频的路径
@@ -141,6 +141,9 @@ class WanV2V:
             torch.Tensor: 视频帧张量，形状为[3, video_length, h, w]
             torch.Tensor: 视频掩码张量，如果不需要遮罩则全为1
         """
+        # 根据VAE的时间压缩比调整视频长度
+        video_length = int((video_length - 1) // self.vae_stride[0] * self.vae_stride[0]) + 1 if video_length != 1 else 1
+        
         if isinstance(input_video_path, str):
             cap = cv2.VideoCapture(input_video_path)
             input_video = []
@@ -260,7 +263,19 @@ class WanV2V:
         h = lat_h * self.vae_stride[1]
         w = lat_w * self.vae_stride[2]
 
-        max_seq_len = ((F - 1) // self.vae_stride[0] + 1) * lat_h * lat_w // (
+        # 确保帧数符合VAE的时间压缩要求
+        F = int((F - 1) // self.vae_stride[0] * self.vae_stride[0]) + 1 if F != 1 else 1
+        
+        # 计算潜在帧数
+        latent_frames = (F - 1) // self.vae_stride[0] + 1
+        
+        # 确保潜在帧数能被patch_size整除
+        if self.patch_size[0] > 1 and latent_frames % self.patch_size[0] != 0:
+            additional_frames = self.patch_size[0] - latent_frames % self.patch_size[0]
+            F += additional_frames * self.vae_stride[0]
+            latent_frames += additional_frames
+        
+        max_seq_len = latent_frames * lat_h * lat_w // (
             self.patch_size[1] * self.patch_size[2])
         max_seq_len = int(math.ceil(max_seq_len / self.sp_size)) * self.sp_size
 
@@ -278,21 +293,59 @@ class WanV2V:
         if n_prompt == "":
             n_prompt = self.sample_neg_prompt
 
-        # 预处理
+        # 预处理文本 - 使用CPU处理以节省显存
         if not self.t5_cpu:
-            self.text_encoder.model.to(self.device)
-            context = self.text_encoder([input_prompt], self.device)
-            context_null = self.text_encoder([n_prompt], self.device)
+            # 如果启用了offload_model，先将模型移到CPU
             if offload_model:
-                self.text_encoder.model.cpu()
+                self.text_encoder.model.to(torch.device('cpu'))
+                context = self.text_encoder([input_prompt], torch.device('cpu'))
+                context_null = self.text_encoder([n_prompt], torch.device('cpu'))
+                context = [t.to(self.device) for t in context]
+                context_null = [t.to(self.device) for t in context_null]
+            else:
+                self.text_encoder.model.to(self.device)
+                context = self.text_encoder([input_prompt], self.device)
+                context_null = self.text_encoder([n_prompt], self.device)
+                if offload_model:
+                    self.text_encoder.model.cpu()
         else:
             context = self.text_encoder([input_prompt], torch.device('cpu'))
             context_null = self.text_encoder([n_prompt], torch.device('cpu'))
             context = [t.to(self.device) for t in context]
             context_null = [t.to(self.device) for t in context_null]
 
-        # 编码视频
-        latents = self.vae.encode([input_video])[0]
+        # 编码视频 - 分批处理以减少显存使用
+        # 将VAE移到GPU
+        self.vae.to(self.device)
+        
+        # 分批编码视频以减少显存使用
+        batch_size = 4  # 可以根据显存大小调整
+        latents_list = []
+        
+        for i in range(0, input_video.shape[1], batch_size):
+            end_idx = min(i + batch_size, input_video.shape[1])
+            batch_frames = input_video[:, i:end_idx]
+            with torch.no_grad():
+                batch_latents = self.vae.encode([batch_frames])[0]
+            latents_list.append(batch_latents)
+            
+            # 清理显存
+            del batch_frames
+            torch.cuda.empty_cache()
+            
+        latents = torch.cat(latents_list, dim=1)
+        
+        # 确保潜在变量维度符合模型要求
+        if self.patch_size[0] > 1 and latents.shape[1] % self.patch_size[0] != 0:
+            pad_size = self.patch_size[0] - (latents.shape[1] % self.patch_size[0])
+            # 复制最后几帧进行填充
+            padding = latents[:, -pad_size:]
+            latents = torch.cat([latents, padding], dim=1)
+        
+        # 如果启用了offload_model，将VAE移回CPU
+        if offload_model:
+            self.vae.cpu()
+            torch.cuda.empty_cache()
         
         # 基于降噪强度添加噪声
         noise = torch.randn(
@@ -327,29 +380,40 @@ class WanV2V:
                                               sigmas=sampling_sigmas,
                                               device=self.device)
 
-            # 根据降噪强度计算起始步骤
-            t_start = max(1, int(denoise_strength * len(timesteps)))
+            # 根据降噪强度计算起始步骤 - 修正映射逻辑
+            start_step = int(denoise_strength * self.num_train_timesteps)
             if denoise_strength <= 0.01:  # 如果降噪强度几乎为0，直接返回原始视频
                 return input_video
-            
+                
             # 创建新的schedular用于添加噪声
             noise_scheduler = FlowUniPCMultistepScheduler(
                 num_train_timesteps=self.num_train_timesteps,
                 shift=1,
                 use_dynamic_shifting=False)
             
-            # 计算起始时间步索引
-            start_step = int(denoise_strength * self.num_train_timesteps)
-            start_timestep = torch.tensor([start_step], device=self.device)
-            
             # 添加噪声到latents
+            start_timestep = torch.tensor([start_step], device=self.device)
             latents_noisy = noise_scheduler.add_noise(latents, noise, start_timestep)
             
-            # 取最后t_start个时间步
-            working_timesteps = timesteps[-t_start:]
+            # 计算对应的时间步索引
+            timestep_indices = []
+            for t in timesteps:
+                diff = torch.abs(t - start_step)
+                if diff <= self.num_train_timesteps / sampling_steps:
+                    timestep_indices.append(True)
+                else:
+                    timestep_indices.append(False)
             
+            # 取需要处理的时间步
+            working_timesteps = timesteps[timestep_indices]
+            
+            # 如果没有时间步需要处理，取最接近的几个
+            if len(working_timesteps) == 0:
+                t_start = max(1, int(denoise_strength * len(timesteps)))
+                working_timesteps = timesteps[-t_start:]
+            
+            # 将模型移到GPU
             self.model.to(self.device)
-            self.vae.to(self.device)
             
             # 降噪循环
             latents_sample = latents_noisy
@@ -391,12 +455,38 @@ class WanV2V:
                     if i < len(working_timesteps) - 1:
                         torch.cuda.empty_cache()
             
-            # 解码生成的视频
-            video = self.vae.decode([latents_sample])[0]
-            
-            # 将模型卸载到CPU
+            # 将模型移回CPU以节省显存
             if offload_model:
                 self.model.cpu()
+                torch.cuda.empty_cache()
+            
+            # 将VAE移到GPU进行解码
+            self.vae.to(self.device)
+            
+            # 分批解码以减少显存使用
+            video_chunks = []
+            chunk_size = 4  # 可以根据显存大小调整
+            
+            for i in range(0, latents_sample.shape[1], chunk_size):
+                end_idx = min(i + chunk_size, latents_sample.shape[1])
+                chunk_latents = latents_sample[:, i:end_idx]
+                with torch.no_grad():
+                    chunk_video = self.vae.decode([chunk_latents])[0]
+                video_chunks.append(chunk_video)
+                
+                # 清理显存
+                del chunk_latents, chunk_video
+                torch.cuda.empty_cache()
+            
+            # 合并视频块
+            video = torch.cat(video_chunks, dim=1)
+            
+            # 将所有模型卸载到CPU
+            if offload_model:
+                self.vae.cpu()
+                self.model.cpu()
+                if hasattr(self, 'clip') and self.use_clip:
+                    self.clip.model.cpu()
                 torch.cuda.empty_cache()
         
         return video 

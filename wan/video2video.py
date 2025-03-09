@@ -348,8 +348,8 @@ class WanV2V:
             # 取最后t_start个时间步
             working_timesteps = timesteps[-t_start:]
             
-            self.model.model.to(self.device)
-            self.vae.model.to(self.device)
+            self.model.to(self.device)
+            self.vae.to(self.device)
             
             # 降噪循环
             latents_sample = latents_noisy
@@ -396,7 +396,7 @@ class WanV2V:
             
             # 将模型卸载到CPU
             if offload_model:
-                self.model.model.cpu()
+                self.model.cpu()
                 torch.cuda.empty_cache()
         
         return video 

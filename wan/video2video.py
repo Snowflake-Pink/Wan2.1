@@ -78,28 +78,53 @@ class WanV2V:
         self.patch_size = config.patch_size
         self.t5_cpu = t5_cpu
 
-        # vae
-        self.vae = WanVAE(
-            config.vae_config, checkpoint=self.vae_checkpoint).to(self.device)
+        # 设置shard函数
+        shard_fn = partial(shard_model, device_id=device_id)
+        
         # t5 encoder
         self.text_encoder = T5EncoderModel(
-            config.t5_config, checkpoint=config.t5_checkpoint, rank=rank)
-        # Visual Model CLIP
-        if hasattr(config, 'clip_config'):
+            text_len=config.text_len,
+            dtype=config.t5_dtype,
+            device=torch.device('cpu') if t5_cpu else self.device,
+            checkpoint_path=os.path.join(checkpoint_dir, config.t5_checkpoint),
+            tokenizer_path=os.path.join(checkpoint_dir, config.t5_tokenizer)
+            if hasattr(config, 't5_tokenizer') else config.t5_model,
+            shard_fn=shard_fn if t5_fsdp else None,
+        )
+        
+        # vae
+        self.vae = WanVAE(
+            vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
+            device=self.device)
+            
+        # Visual Model CLIP (如果配置中有)
+        if hasattr(config, 'clip_model'):
             self.use_clip = True
             self.clip = CLIPModel(
-                config.clip_config, checkpoint=config.clip_checkpoint)
+                dtype=config.clip_dtype,
+                device=self.device,
+                checkpoint_path=os.path.join(checkpoint_dir, config.clip_checkpoint),
+                tokenizer_path=os.path.join(checkpoint_dir, config.clip_tokenizer) 
+                if hasattr(config, 'clip_tokenizer') else config.clip_model
+            )
         else:
             self.use_clip = False
+            
         # DIT
-        self.model = WanModel(
-            config,
-            checkpoint=config.dit_checkpoint,
-            use_fp16=not init_on_cpu,
-            rank=rank,
-            t5_fsdp=self.t5_fsdp,
-            dit_fsdp=self.dit_fsdp,
-            use_usp=self.use_usp)
+        logging.info(f"Creating WanModel from {checkpoint_dir}")
+        self.model = WanModel.from_pretrained(checkpoint_dir)
+        self.model.eval().requires_grad_(False)
+        
+        # 如果使用USP
+        if use_usp:
+            from xfuser.core.distributed import \
+                get_sequence_parallel_world_size
+
+            from .distributed.xdit_context_parallel import (usp_attn_forward,
+                                                            usp_dit_forward)
+            for block in self.model.blocks:
+                block.self_attn.forward = types.MethodType(
+                    usp_attn_forward, block.self_attn)
 
     def get_video_frames(self, input_video_path, video_length, h, w, fps=None):
         """

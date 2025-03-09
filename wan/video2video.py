@@ -138,7 +138,7 @@ class WanV2V:
             fps (int, optional): 目标帧率，如果为None则使用原视频帧率
             
         Returns:
-            torch.Tensor: 视频帧张量，形状为[1, 3, video_length, h, w]
+            torch.Tensor: 视频帧张量，形状为[3, video_length, h, w]
             torch.Tensor: 视频掩码张量，如果不需要遮罩则全为1
         """
         if isinstance(input_video_path, str):
@@ -177,10 +177,11 @@ class WanV2V:
             
         # 转换为torch张量，并规范化到[-1, 1]
         input_video = torch.from_numpy(input_video)
-        input_video = input_video.permute(3, 0, 1, 2).unsqueeze(0) / 127.5 - 1
+        # 调整维度顺序：[frames, height, width, channels] -> [channels, frames, height, width]
+        input_video = input_video.permute(3, 0, 1, 2) / 127.5 - 1
         
-        # 创建视频掩码
-        input_video_mask = torch.zeros_like(input_video[:, 0:1, :, :, :])
+        # 创建视频掩码（所有像素都有效）
+        input_video_mask = torch.ones_like(input_video[0:1])
         
         return input_video, input_video_mask
 

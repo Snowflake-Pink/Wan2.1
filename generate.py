@@ -73,8 +73,9 @@ def _validate_args(args):
     if args.size is None:
         args.size = "512*288" if "t2i" in args.task else "640*360"
 
-    assert args.size in SUPPORTED_SIZES, \
-        f"Unsupported size: {args.size}. Only {SUPPORTED_SIZES} are supported."
+    # 确保尺寸在支持的列表中
+    assert args.size in SUPPORTED_SIZES[args.task], \
+        f"Unsupported size: {args.size} for task {args.task}. Only {SUPPORTED_SIZES[args.task]} are supported."
 
     if args.frame_num is None:
         args.frame_num = 81

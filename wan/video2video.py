@@ -293,26 +293,27 @@ class WanV2V:
         if n_prompt == "":
             n_prompt = self.sample_neg_prompt
 
-        # 预处理文本 - 使用CPU处理以节省显存
-        if not self.t5_cpu:
-            # 如果启用了offload_model，先将模型移到CPU
-            if offload_model:
-                self.text_encoder.model.to(torch.device('cpu'))
-                context = self.text_encoder([input_prompt], torch.device('cpu'))
-                context_null = self.text_encoder([n_prompt], torch.device('cpu'))
-                context = [t.to(self.device) for t in context]
-                context_null = [t.to(self.device) for t in context_null]
-            else:
-                self.text_encoder.model.to(self.device)
-                context = self.text_encoder([input_prompt], self.device)
-                context_null = self.text_encoder([n_prompt], self.device)
-                if offload_model:
-                    self.text_encoder.model.cpu()
-        else:
+        # 预处理文本
+        # 当使用FSDP时，必须在GPU上处理文本
+        if self.t5_fsdp:
+            # 如果使用FSDP，必须在GPU上处理
+            self.text_encoder.model.to(self.device)
+            context = self.text_encoder([input_prompt], self.device)
+            context_null = self.text_encoder([n_prompt], self.device)
+            # 注意：使用FSDP时不能将模型移回CPU
+        elif self.t5_cpu:
+            # 如果启用t5_cpu但没有启用FSDP
             context = self.text_encoder([input_prompt], torch.device('cpu'))
             context_null = self.text_encoder([n_prompt], torch.device('cpu'))
             context = [t.to(self.device) for t in context]
             context_null = [t.to(self.device) for t in context_null]
+        else:
+            # 正常情况，可以在GPU上处理后再移回CPU
+            self.text_encoder.model.to(self.device)
+            context = self.text_encoder([input_prompt], self.device)
+            context_null = self.text_encoder([n_prompt], self.device)
+            if offload_model and not self.t5_fsdp:
+                self.text_encoder.model.cpu()
 
         # 编码视频 - 分批处理以减少显存使用
         # 将VAE移到GPU
@@ -455,8 +456,8 @@ class WanV2V:
                     if i < len(working_timesteps) - 1:
                         torch.cuda.empty_cache()
             
-            # 将模型移回CPU以节省显存
-            if offload_model:
+            # 将模型移回CPU以节省显存 - 只有当不使用FSDP时才移回CPU
+            if offload_model and not self.dit_fsdp:
                 self.model.cpu()
                 torch.cuda.empty_cache()
             
@@ -484,7 +485,10 @@ class WanV2V:
             # 将所有模型卸载到CPU
             if offload_model:
                 self.vae.cpu()
-                self.model.cpu()
+                if not self.dit_fsdp:
+                    self.model.cpu()
+                if not self.t5_fsdp:
+                    self.text_encoder.model.cpu()
                 if hasattr(self, 'clip') and self.use_clip:
                     self.clip.model.cpu()
                 torch.cuda.empty_cache()

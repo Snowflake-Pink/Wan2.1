@@ -328,18 +328,25 @@ class WanV2V:
                                               device=self.device)
 
             # 根据降噪强度计算起始步骤
-            t_start = int(denoise_strength * len(timesteps))
-            if t_start == 0:
+            t_start = max(1, int(denoise_strength * len(timesteps)))
+            if denoise_strength <= 0.01:  # 如果降噪强度几乎为0，直接返回原始视频
                 return input_video
             
-            # 根据起始步骤添加噪声到latents
-            step_proportion = t_start / len(timesteps)
-            t_start_idx = int(step_proportion * self.num_train_timesteps)
-            latents_noisy = sample_scheduler.add_noise(
-                latents, noise, torch.tensor([t_start_idx], device=self.device))
+            # 创建新的schedular用于添加噪声
+            noise_scheduler = FlowUniPCMultistepScheduler(
+                num_train_timesteps=self.num_train_timesteps,
+                shift=1,
+                use_dynamic_shifting=False)
             
-            # 缩小时间步
-            timesteps = timesteps[-t_start:]
+            # 计算起始时间步索引
+            start_step = int(denoise_strength * self.num_train_timesteps)
+            start_timestep = torch.tensor([start_step], device=self.device)
+            
+            # 添加噪声到latents
+            latents_noisy = noise_scheduler.add_noise(latents, noise, start_timestep)
+            
+            # 取最后t_start个时间步
+            working_timesteps = timesteps[-t_start:]
             
             self.model.model.to(self.device)
             self.vae.model.to(self.device)
@@ -347,9 +354,9 @@ class WanV2V:
             # 降噪循环
             latents_sample = latents_noisy
             for i, t in tqdm(
-                enumerate(timesteps), 
+                enumerate(working_timesteps), 
                 desc="V2V Denoising",
-                total=len(timesteps)):
+                total=len(working_timesteps)):
                 # 在每个去噪步骤中，获取调节
                 latent_model_input = torch.cat([latents_sample] * 2)
                 
@@ -381,7 +388,7 @@ class WanV2V:
                 # 清理
                 if offload_model:
                     del noise_pred, latent_model_input
-                    if i < len(timesteps) - 1:
+                    if i < len(working_timesteps) - 1:
                         torch.cuda.empty_cache()
             
             # 解码生成的视频

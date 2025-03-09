@@ -1,0 +1,369 @@
+# Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
+import gc
+import logging
+import math
+import os
+import random
+import sys
+import types
+import cv2
+import numpy as np
+from contextlib import contextmanager
+from functools import partial
+
+import torch
+import torch.cuda.amp as amp
+import torch.distributed as dist
+from tqdm import tqdm
+from PIL import Image
+
+from .distributed.fsdp import shard_model
+from .modules.clip import CLIPModel
+from .modules.model import WanModel
+from .modules.t5 import T5EncoderModel
+from .modules.vae import WanVAE
+from .utils.fm_solvers import (FlowDPMSolverMultistepScheduler,
+                               get_sampling_sigmas, retrieve_timesteps)
+from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+
+
+class WanV2V:
+
+    def __init__(
+        self,
+        config,
+        checkpoint_dir,
+        device_id=0,
+        rank=0,
+        t5_fsdp=False,
+        dit_fsdp=False,
+        use_usp=False,
+        t5_cpu=False,
+        init_on_cpu=True,
+    ):
+        r"""
+        Initializes the video-to-video generation model components.
+
+        Args:
+            config (EasyDict):
+                Object containing model parameters initialized from config.py
+            checkpoint_dir (`str`):
+                Path to directory containing model checkpoints
+            device_id (`int`, *optional*, defaults to 0):
+                GPU device ID to use
+            rank (`int`, *optional*, defaults to 0):
+                Process rank in distributed environment
+            t5_fsdp (`bool`, *optional*, defaults to False):
+                Whether to use FSDP for text encoder
+            dit_fsdp (`bool`, *optional*, defaults to False):
+                Whether to use FSDP for diffusion transformer
+            use_usp (`bool`, *optional*, defaults to False):
+                Whether to use usp for context parallel
+            t5_cpu (`bool`, *optional*, defaults to False):
+                Whether to keep text encoder on CPU
+            init_on_cpu (`bool`, *optional*, defaults to True):
+                Whether to initialize model weights on CPU
+        """
+        self.device = f"cuda:{device_id}"
+        self.param_dtype = torch.float16
+        self.t5_fsdp = t5_fsdp
+        self.dit_fsdp = dit_fsdp
+        self.use_usp = use_usp
+        self.sp_size = config.sp_size if hasattr(config, 'sp_size') else 1
+        self.num_train_timesteps = 1000
+        self.sample_neg_prompt = config.sample_neg_prompt if hasattr(
+            config, 'sample_neg_prompt') else ""
+        self.vae_checkpoint = config.vae_checkpoint
+        self.vae_stride = config.vae_stride
+        self.patch_size = config.patch_size
+        self.t5_cpu = t5_cpu
+
+        # vae
+        self.vae = WanVAE(
+            config.vae_config, checkpoint=self.vae_checkpoint).to(self.device)
+        # t5 encoder
+        self.text_encoder = T5EncoderModel(
+            config.t5_config, checkpoint=config.t5_checkpoint, rank=rank)
+        # Visual Model CLIP
+        if hasattr(config, 'clip_config'):
+            self.use_clip = True
+            self.clip = CLIPModel(
+                config.clip_config, checkpoint=config.clip_checkpoint)
+        else:
+            self.use_clip = False
+        # DIT
+        self.model = WanModel(
+            config,
+            checkpoint=config.dit_checkpoint,
+            use_fp16=not init_on_cpu,
+            rank=rank,
+            t5_fsdp=self.t5_fsdp,
+            dit_fsdp=self.dit_fsdp,
+            use_usp=self.use_usp)
+
+    def get_video_frames(self, input_video_path, video_length, h, w, fps=None):
+        """
+        读取视频文件并提取帧
+        
+        Args:
+            input_video_path (str): 输入视频的路径
+            video_length (int): 需要的视频帧数
+            h (int): 目标高度
+            w (int): 目标宽度
+            fps (int, optional): 目标帧率，如果为None则使用原视频帧率
+            
+        Returns:
+            torch.Tensor: 视频帧张量，形状为[1, 3, video_length, h, w]
+            torch.Tensor: 视频掩码张量，如果不需要遮罩则全为1
+        """
+        if isinstance(input_video_path, str):
+            cap = cv2.VideoCapture(input_video_path)
+            input_video = []
+
+            original_fps = cap.get(cv2.CAP_PROP_FPS)
+            frame_skip = 1 if fps is None else int(original_fps // fps)
+
+            frame_count = 0
+
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+                if frame_count % frame_skip == 0:
+                    frame = cv2.resize(frame, (w, h))
+                    input_video.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+
+                frame_count += 1
+
+            cap.release()
+        else:
+            input_video = input_video_path
+
+        # 确保没有超出所需的帧数
+        input_video = np.array(input_video)[:video_length]
+        actual_frames = input_video.shape[0]
+        
+        # 如果实际帧数小于所需帧数，则复制最后一帧
+        if actual_frames < video_length:
+            last_frame = input_video[-1:]
+            padding = np.tile(last_frame, (video_length - actual_frames, 1, 1, 1))
+            input_video = np.concatenate([input_video, padding], axis=0)
+            
+        # 转换为torch张量，并规范化到[-1, 1]
+        input_video = torch.from_numpy(input_video)
+        input_video = input_video.permute(3, 0, 1, 2).unsqueeze(0) / 127.5 - 1
+        
+        # 创建视频掩码
+        input_video_mask = torch.zeros_like(input_video[:, 0:1, :, :, :])
+        
+        return input_video, input_video_mask
+
+    def generate(self,
+                 input_prompt,
+                 video_path,
+                 max_area=720 * 1280,
+                 frame_num=81,
+                 shift=5.0,
+                 sample_solver='unipc',
+                 sampling_steps=40,
+                 guide_scale=5.0,
+                 n_prompt="",
+                 denoise_strength=0.7,
+                 seed=-1,
+                 fps=None,
+                 offload_model=True):
+        r"""
+        从输入视频和文本提示中生成新的视频，通过扩散过程重新绘制视频内容。
+
+        Args:
+            input_prompt (`str`):
+                用于内容生成的文本提示。
+            video_path (`str`):
+                输入视频的路径。
+            max_area (`int`, *optional*, defaults to 720*1280):
+                潜在空间计算的最大像素面积。控制视频分辨率缩放。
+            frame_num (`int`, *optional*, defaults to 81):
+                从视频中采样的帧数。数字应为4n+1。
+            shift (`float`, *optional*, defaults to 5.0):
+                噪声调度移位参数。影响时间动态。
+                [注意]: 如果你想生成480p视频，建议将shift值设为3.0。
+            sample_solver (`str`, *optional*, defaults to 'unipc'):
+                用于采样视频的求解器。
+            sampling_steps (`int`, *optional*, defaults to 40):
+                扩散采样步骤的数量。较高的值提高质量但会减慢生成速度。
+            guide_scale (`float`, *optional*, defaults 5.0):
+                无分类器引导比例。控制提示遵从性与创造性。
+            n_prompt (`str`, *optional*, defaults to ""):
+                用于内容排除的负面提示。如果未给出，则使用`config.sample_neg_prompt`。
+            denoise_strength (`float`, *optional*, defaults to 0.7):
+                降噪强度，控制对原始视频的修改程度。值越大，生成的视频与原始视频差异越大。
+            seed (`int`, *optional*, defaults to -1):
+                噪声生成的随机种子。如果为-1，则使用随机种子。
+            fps (`int`, *optional*, defaults to None):
+                目标视频的帧率。如果为None，则使用原始视频的帧率。
+            offload_model (`bool`, *optional*, defaults to True):
+                如果为True，则在生成过程中将模型卸载到CPU以节省VRAM。
+
+        Returns:
+            torch.Tensor:
+                生成的视频帧张量。维度: (C, N, H, W)，其中:
+                - C: 颜色通道(3 for RGB)
+                - N: 帧数
+                - H: 帧高度(来自max_area)
+                - W: 帧宽度(来自max_area)
+        """
+        F = frame_num
+        
+        # 计算适当的视频尺寸
+        if isinstance(video_path, str):
+            cap = cv2.VideoCapture(video_path)
+            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            aspect_ratio = h / w
+            cap.release()
+        else:
+            aspect_ratio = 9 / 16  # 默认16:9比例
+            
+        lat_h = round(
+            np.sqrt(max_area * aspect_ratio) // self.vae_stride[1] //
+            self.patch_size[1] * self.patch_size[1])
+        lat_w = round(
+            np.sqrt(max_area / aspect_ratio) // self.vae_stride[2] //
+            self.patch_size[2] * self.patch_size[2])
+        h = lat_h * self.vae_stride[1]
+        w = lat_w * self.vae_stride[2]
+
+        max_seq_len = ((F - 1) // self.vae_stride[0] + 1) * lat_h * lat_w // (
+            self.patch_size[1] * self.patch_size[2])
+        max_seq_len = int(math.ceil(max_seq_len / self.sp_size)) * self.sp_size
+
+        # 获取视频帧
+        input_video, input_video_mask = self.get_video_frames(
+            video_path, F, h, w, fps=fps)
+        input_video = input_video.to(self.device)
+        input_video_mask = input_video_mask.to(self.device)
+
+        # 设置种子
+        seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
+        seed_g = torch.Generator(device=self.device)
+        seed_g.manual_seed(seed)
+        
+        if n_prompt == "":
+            n_prompt = self.sample_neg_prompt
+
+        # 预处理
+        if not self.t5_cpu:
+            self.text_encoder.model.to(self.device)
+            context = self.text_encoder([input_prompt], self.device)
+            context_null = self.text_encoder([n_prompt], self.device)
+            if offload_model:
+                self.text_encoder.model.cpu()
+        else:
+            context = self.text_encoder([input_prompt], torch.device('cpu'))
+            context_null = self.text_encoder([n_prompt], torch.device('cpu'))
+            context = [t.to(self.device) for t in context]
+            context_null = [t.to(self.device) for t in context_null]
+
+        # 编码视频
+        latents = self.vae.encode([input_video])[0]
+        
+        # 基于降噪强度添加噪声
+        noise = torch.randn(
+            latents.shape,
+            dtype=torch.float32,
+            generator=seed_g,
+            device=self.device)
+        
+        @contextmanager
+        def noop_no_sync():
+            yield
+
+        no_sync = getattr(self.model, 'no_sync', noop_no_sync)
+
+        # 评估模式
+        with amp.autocast(dtype=self.param_dtype), torch.no_grad(), no_sync():
+            if sample_solver == 'unipc':
+                sample_scheduler = FlowUniPCMultistepScheduler(
+                    num_train_timesteps=self.num_train_timesteps,
+                    shift=1,
+                    use_dynamic_shifting=False)
+                sample_scheduler.set_timesteps(
+                    sampling_steps, device=self.device, shift=shift)
+                timesteps = sample_scheduler.timesteps
+            elif sample_solver == 'dpm++':
+                sample_scheduler = FlowDPMSolverMultistepScheduler(
+                    num_train_timesteps=self.num_train_timesteps,
+                    shift=1,
+                    use_dynamic_shifting=False)
+                sampling_sigmas = get_sampling_sigmas(sampling_steps, shift)
+                timesteps = retrieve_timesteps(sample_scheduler,
+                                              sigmas=sampling_sigmas,
+                                              device=self.device)
+
+            # 根据降噪强度计算起始步骤
+            t_start = int(denoise_strength * len(timesteps))
+            if t_start == 0:
+                return input_video
+            
+            # 根据起始步骤添加噪声到latents
+            step_proportion = t_start / len(timesteps)
+            t_start_idx = int(step_proportion * self.num_train_timesteps)
+            latents_noisy = sample_scheduler.add_noise(
+                latents, noise, torch.tensor([t_start_idx], device=self.device))
+            
+            # 缩小时间步
+            timesteps = timesteps[-t_start:]
+            
+            self.model.model.to(self.device)
+            self.vae.model.to(self.device)
+            
+            # 降噪循环
+            latents_sample = latents_noisy
+            for i, t in tqdm(
+                enumerate(timesteps), 
+                desc="V2V Denoising",
+                total=len(timesteps)):
+                # 在每个去噪步骤中，获取调节
+                latent_model_input = torch.cat([latents_sample] * 2)
+                
+                # 预测噪声残差
+                noise_pred = self.model(
+                    input_latents=latent_model_input,
+                    timestep=t,
+                    context=[
+                        torch.cat([context_null[0], context[0]]),
+                        torch.cat([context_null[1], context[1]])
+                    ],
+                    context_mask=torch.cat([
+                        context_null[2], context[2]
+                    ])).sample
+                
+                # 执行调节
+                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                noise_pred = noise_pred_uncond + guide_scale * (
+                    noise_pred_text - noise_pred_uncond)
+                
+                if sample_solver == 'unipc':
+                    latents_sample = sample_scheduler.step(
+                        noise_pred, t, latents_sample).prev_sample
+                elif sample_solver == 'dpm++':
+                    step_result = sample_scheduler.step(
+                        noise_pred, t, latents_sample, step_index=i)
+                    latents_sample = step_result.prev_sample
+                
+                # 清理
+                if offload_model:
+                    del noise_pred, latent_model_input
+                    if i < len(timesteps) - 1:
+                        torch.cuda.empty_cache()
+            
+            # 解码生成的视频
+            video = self.vae.decode([latents_sample])[0]
+            
+            # 将模型卸载到CPU
+            if offload_model:
+                self.model.model.cpu()
+                torch.cuda.empty_cache()
+        
+        return video 

@@ -33,6 +33,12 @@ EXAMPLE_PROMPT = {
         "image":
             "examples/i2v_input.JPG",
     },
+    "v2v-14B": {
+        "prompt": 
+            "A cute orange cat playing the guitar in a sunny park, wearing sunglasses.",
+        "video":
+            "examples/cat_video.mp4",
+    }
 }
 
 
@@ -44,27 +50,37 @@ def _validate_args(args):
 
     # The default sampling steps are 40 for image-to-video tasks and 50 for text-to-video tasks.
     if args.sample_steps is None:
-        args.sample_steps = 40 if "i2v" in args.task else 50
+        args.sample_steps = 40 if "i2v" in args.task or "v2v" in args.task else 50
 
     if args.sample_shift is None:
         args.sample_shift = 5.0
-        if "i2v" in args.task and args.size in ["832*480", "480*832"]:
-            args.sample_shift = 3.0
 
-    # The default number of frames are 1 for text-to-image tasks and 81 for other tasks.
+    # v2v需要denoise_strength参数
+    if args.denoise_strength is None:
+        args.denoise_strength = 0.7
+
+    if "t2v" in args.task or "t2i" in args.task:
+        pass
+    elif "i2v" in args.task:
+        pass
+    elif "v2v" in args.task:
+        # v2v-specific validation
+        assert args.video is not None or args.task in EXAMPLE_PROMPT, \
+            "Please specify the input video path."
+    else:
+        raise ValueError(f"Unsupport task: {args.task}")
+
+    if args.size is None:
+        args.size = "512*288" if "t2i" in args.task else "640*360"
+
+    assert args.size in SUPPORTED_SIZES, \
+        f"Unsupported size: {args.size}. Only {SUPPORTED_SIZES} are supported."
+
     if args.frame_num is None:
-        args.frame_num = 1 if "t2i" in args.task else 81
-
-    # T2I frame_num check
-    if "t2i" in args.task:
-        assert args.frame_num == 1, f"Unsupport frame_num {args.frame_num} for task {args.task}"
+        args.frame_num = 81
 
     args.base_seed = args.base_seed if args.base_seed >= 0 else random.randint(
         0, sys.maxsize)
-    # Size check
-    assert args.size in SUPPORTED_SIZES[
-        args.
-        task], f"Unsupport size {args.size} for task {args.task}, supported sizes are: {', '.join(SUPPORTED_SIZES[args.task])}"
 
 
 def _parse_args():
@@ -80,14 +96,14 @@ def _parse_args():
     parser.add_argument(
         "--size",
         type=str,
-        default="1280*720",
+        default=None,
         choices=list(SIZE_CONFIGS.keys()),
         help="The area (width*height) of the generated video. For the I2V task, the aspect ratio of the output video will follow that of the input image."
     )
     parser.add_argument(
         "--frame_num",
         type=int,
-        default=None,
+        default=81,
         help="How many frames to sample from a image or video. The number should be 4n+1"
     )
     parser.add_argument(
@@ -169,6 +185,11 @@ def _parse_args():
         default=None,
         help="The image to generate the video from.")
     parser.add_argument(
+        "--video",
+        type=str,
+        default=None,
+        help="The video to generate the video from.")
+    parser.add_argument(
         "--sample_solver",
         type=str,
         default='unipc',
@@ -186,6 +207,11 @@ def _parse_args():
         type=float,
         default=5.0,
         help="Classifier free guidance scale.")
+    parser.add_argument(
+        "--denoise_strength",
+        type=float,
+        default=None,
+        help="Denoising strength for video-to-video generation (0-1). Higher values result in more changes.")
 
     args = parser.parse_args()
 
@@ -321,7 +347,7 @@ def generate(args):
             seed=args.base_seed,
             offload_model=args.offload_model)
 
-    else:
+    elif "i2v" in args.task:
         if args.prompt is None:
             args.prompt = EXAMPLE_PROMPT[args.task]["prompt"]
         if args.image is None:
@@ -377,6 +403,63 @@ def generate(args):
             guide_scale=args.sample_guide_scale,
             seed=args.base_seed,
             offload_model=args.offload_model)
+    
+    elif "v2v" in args.task:
+        if args.prompt is None:
+            args.prompt = EXAMPLE_PROMPT[args.task]["prompt"]
+        if args.video is None:
+            args.video = EXAMPLE_PROMPT[args.task]["video"]
+        logging.info(f"Input prompt: {args.prompt}")
+        logging.info(f"Input video: {args.video}")
+
+        if args.use_prompt_extend:
+            logging.info("Extending prompt ...")
+            if rank == 0:
+                prompt_output = prompt_expander(
+                    args.prompt,
+                    tar_lang=args.prompt_extend_target_lang,
+                    seed=args.base_seed)
+                if prompt_output.status == False:
+                    logging.info(
+                        f"Extending prompt failed: {prompt_output.message}")
+                    logging.info("Falling back to original prompt.")
+                    input_prompt = args.prompt
+                else:
+                    input_prompt = prompt_output.prompt
+                input_prompt = [input_prompt]
+            else:
+                input_prompt = [None]
+            if dist.is_initialized():
+                dist.broadcast_object_list(input_prompt, src=0)
+            args.prompt = input_prompt[0]
+            logging.info(f"Extended prompt: {args.prompt}")
+
+        logging.info("Creating WanV2V pipeline.")
+        wan_v2v = wan.WanV2V(
+            config=cfg,
+            checkpoint_dir=args.ckpt_dir,
+            device_id=device,
+            rank=rank,
+            t5_fsdp=args.t5_fsdp,
+            dit_fsdp=args.dit_fsdp,
+            use_usp=(args.ulysses_size > 1 or args.ring_size > 1),
+            t5_cpu=args.t5_cpu,
+        )
+
+        logging.info("Generating video ...")
+        video = wan_v2v.generate(
+            args.prompt,
+            args.video,
+            max_area=MAX_AREA_CONFIGS[args.size],
+            frame_num=args.frame_num,
+            shift=args.sample_shift,
+            sample_solver=args.sample_solver,
+            sampling_steps=args.sample_steps,
+            guide_scale=args.sample_guide_scale,
+            denoise_strength=args.denoise_strength,
+            seed=args.base_seed,
+            fps=8,  # 默认使用8fps
+            offload_model=args.offload_model)
 
     if rank == 0:
         if args.save_file is None:
@@ -399,10 +482,7 @@ def generate(args):
             cache_video(
                 tensor=video[None],
                 save_file=args.save_file,
-                fps=cfg.sample_fps,
-                nrow=1,
-                normalize=True,
-                value_range=(-1, 1))
+                fps=8)
     logging.info("Finished.")
 
 

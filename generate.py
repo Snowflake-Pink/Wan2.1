@@ -559,7 +559,7 @@ def generate(args):
                      dit_fsdp=args.dit_fsdp,
                      use_usp=args.ulysses_size > 1 or args.ring_size > 1)
         
-        model_output, fps = model.generate(prompt=args.prompt,
+        model_output, fps = model.generate(input_prompt=args.prompt,
                                         video_path=video_path,
                                         mask_path=args.mask_path,
                                         max_area=MAX_AREA_CONFIGS[args.size],

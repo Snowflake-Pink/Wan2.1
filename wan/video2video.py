@@ -265,6 +265,16 @@ class WanV2V:
         # 确保模型在正确的设备上
         if not isinstance(self.model, torch.nn.parallel.DistributedDataParallel):
             self.model = self.model.to(self.device)
+        
+        # 修改模型类型，因为我们正在执行 v2v 任务，但使用的是 i2v 模型
+        if isinstance(self.model, torch.nn.parallel.DistributedDataParallel):
+            if hasattr(self.model.module, 'model_type') and self.model.module.model_type == 'i2v':
+                logging.info("检测到 I2V 模型（DDP），修改 model_type 为 't2v' 以支持视频到视频任务")
+                self.model.module.model_type = 't2v'
+        else:
+            if hasattr(self.model, 'model_type') and self.model.model_type == 'i2v':
+                logging.info("检测到 I2V 模型，修改 model_type 为 't2v' 以支持视频到视频任务")
+                self.model.model_type = 't2v'
 
         # 设置采样器
         if sample_solver == 'unipc':
@@ -312,18 +322,18 @@ class WanV2V:
                 if isinstance(model, torch.nn.parallel.DistributedDataParallel):
                     model_output = torch.utils.checkpoint.checkpoint(
                         model.module.forward,
-                        latent_model_input,
-                        text_embeds.repeat(2, 1, 1) if neg_text_embeds is not None else text_embeds,
-                        model_t,
-                        self.config.text_len,
+                        latent_model_input,  # x
+                        model_t,  # t
+                        text_embeds.repeat(2, 1, 1) if neg_text_embeds is not None else text_embeds,  # context
+                        self.config.text_len,  # seq_len
                     )
                 else:
                     model_output = torch.utils.checkpoint.checkpoint(
                         model.forward,
-                        latent_model_input,
-                        text_embeds.repeat(2, 1, 1) if neg_text_embeds is not None else text_embeds,
-                        model_t,
-                        self.config.text_len,
+                        latent_model_input,  # x
+                        model_t,  # t
+                        text_embeds.repeat(2, 1, 1) if neg_text_embeds is not None else text_embeds,  # context
+                        self.config.text_len,  # seq_len
                     )
                 
                 # 分类器引导处理

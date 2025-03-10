@@ -244,19 +244,23 @@ class WanV2V:
 
         # 处理文本提示
         device = torch.device("cpu") if self.t5_cpu else self.device
-        text_embeds = self.text_encoder.get_text_embeddings(
-            input_prompt, device=device)
+        text_embeds = self.text_encoder(
+            [input_prompt], device=device)
         
         if self.t5_cpu:
-            text_embeds = text_embeds.to(self.device)
+            text_embeds = [x.to(self.device) for x in text_embeds]
+        
+        # T5EncoderModel.__call__ 返回一个列表，我们取第一个元素（只有一个提示）
+        text_embeds = text_embeds[0]
 
         # 处理负面提示
         neg_text_embeds = None
         if guide_scale > 1.0 and n_prompt:
-            neg_text_embeds = self.text_encoder.get_text_embeddings(
-                n_prompt, device=device)
+            neg_text_embeds = self.text_encoder(
+                [n_prompt], device=device)
             if self.t5_cpu:
-                neg_text_embeds = neg_text_embeds.to(self.device)
+                neg_text_embeds = [x.to(self.device) for x in neg_text_embeds]
+            neg_text_embeds = neg_text_embeds[0]
 
         # 确保模型在正确的设备上
         if not isinstance(self.model, torch.nn.parallel.DistributedDataParallel):

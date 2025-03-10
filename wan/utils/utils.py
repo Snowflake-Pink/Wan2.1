@@ -7,8 +7,10 @@ import os.path as osp
 import imageio
 import torch
 import torchvision
+import cv2
+import numpy as np
 
-__all__ = ['cache_video', 'cache_image', 'str2bool']
+__all__ = ['cache_video', 'cache_image', 'str2bool', 'get_video_frames']
 
 
 def rand_name(length=8, suffix=''):
@@ -116,3 +118,65 @@ def str2bool(v):
         return False
     else:
         raise argparse.ArgumentTypeError('Boolean value expected (True/False)')
+
+
+def get_video_frames(video_path, frame_count=None):
+    """
+    从视频文件中提取帧。
+    
+    Args:
+        video_path (str): 视频文件的路径
+        frame_count (int, optional): 要提取的帧数，如果为 None，则提取所有帧
+        
+    Returns:
+        tuple: 包含以下元素的元组:
+            - frames (list): 视频帧列表
+            - width (int): 视频宽度
+            - height (int): 视频高度
+            - fps (float): 视频帧率
+    """
+    if not os.path.exists(video_path):
+        raise FileNotFoundError(f"视频文件 {video_path} 不存在")
+    
+    video = cv2.VideoCapture(video_path)
+    if not video.isOpened():
+        raise ValueError(f"无法打开视频文件 {video_path}")
+    
+    width = int(video.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(video.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = float(video.get(cv2.CAP_PROP_FPS))
+    total_frames = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
+    
+    frames = []
+    
+    if frame_count is None:
+        # 提取所有帧
+        while True:
+            ret, frame = video.read()
+            if not ret:
+                break
+            # 将 BGR 转换为 RGB
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frames.append(frame)
+    else:
+        # 提取指定数量的帧
+        if frame_count > total_frames:
+            # 如果请求的帧数超过了视频中的总帧数，调整为视频的总帧数
+            frame_count = total_frames
+        
+        # 计算采样间隔
+        interval = total_frames / frame_count
+        frame_indices = [int(i * interval) for i in range(frame_count)]
+        
+        for idx in frame_indices:
+            video.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ret, frame = video.read()
+            if not ret:
+                break
+            # 将 BGR 转换为 RGB
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frames.append(frame)
+    
+    video.release()
+    
+    return frames, width, height, fps

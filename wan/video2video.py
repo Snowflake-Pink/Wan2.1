@@ -323,18 +323,13 @@ class WanV2V:
                 latent_model_input = torch.cat([latents] * 2) if neg_text_embeds is not None else latents
                 
                 if isinstance(model, torch.nn.parallel.DistributedDataParallel):
-                    # 从视频的第一帧提取 CLIP 特征
+                    # 从视频中提取 CLIP 特征
                     # 注意：video_tensor 的形状为 [B, T, C, H, W]
-                    # 我们需要提取第一帧并将其转为 [C, H, W] 形状
-                    first_frame = video_tensor[0, 0]  # 提取第一个批次的第一帧 [C, H, W]
-                    # 使用尺寸为 CLIP 模型所需的 224x224
-                    resized_frame = torch.nn.functional.interpolate(
-                        first_frame.unsqueeze(0),  # 添加批次维度 [1, C, H, W]
-                        size=(224, 224),
-                        mode='bicubic',
-                        align_corners=False
-                    ).squeeze(0)  # 移除批次维度，得到 [C, H, W]
-                    clip_features = self.clip.visual([resized_frame])
+                    # CLIP 的 visual 方法期望的输入是 [C, T, H, W]
+                    clip_input = video_tensor[0].permute(1, 0, 2, 3)  # [C, T, H, W]
+                    # 如果帧太多，只使用前几帧
+                    clip_input = clip_input[:, :8] if clip_input.shape[1] > 8 else clip_input
+                    clip_features = self.clip.visual([clip_input])
                     
                     model_output = torch.utils.checkpoint.checkpoint(
                         model.module.forward,
@@ -346,18 +341,13 @@ class WanV2V:
                         init_latents,  # y (使用初始潜在表示作为条件输入)
                     )
                 else:
-                    # 从视频的第一帧提取 CLIP 特征
+                    # 从视频中提取 CLIP 特征
                     # 注意：video_tensor 的形状为 [B, T, C, H, W]
-                    # 我们需要提取第一帧并将其转为 [C, H, W] 形状
-                    first_frame = video_tensor[0, 0]  # 提取第一个批次的第一帧 [C, H, W]
-                    # 使用尺寸为 CLIP 模型所需的 224x224
-                    resized_frame = torch.nn.functional.interpolate(
-                        first_frame.unsqueeze(0),  # 添加批次维度 [1, C, H, W]
-                        size=(224, 224),
-                        mode='bicubic',
-                        align_corners=False
-                    ).squeeze(0)  # 移除批次维度，得到 [C, H, W]
-                    clip_features = self.clip.visual([resized_frame])
+                    # CLIP 的 visual 方法期望的输入是 [C, T, H, W]
+                    clip_input = video_tensor[0].permute(1, 0, 2, 3)  # [C, T, H, W]
+                    # 如果帧太多，只使用前几帧
+                    clip_input = clip_input[:, :8] if clip_input.shape[1] > 8 else clip_input
+                    clip_features = self.clip.visual([clip_input])
                     
                     model_output = torch.utils.checkpoint.checkpoint(
                         model.forward,

@@ -233,9 +233,14 @@ class WanV2V:
         
         # 使用VAE编码视频帧
         with torch.no_grad():
-            video_latents = self.vae.encode(video_tensor)
-        
-        video_latents = video_latents.unsqueeze(0) # [1, 1, C, T, H, W]
+            # VAE.encode 方法期望输入是一个视频列表，每个视频形状为 [C, T, H, W]
+            # 因此我们需要将视频张量转换为列表
+            video_list = [video_tensor.squeeze(0)]  # 移除批次维度
+            video_latents_list = self.vae.encode(video_list)  # 这会返回一个列表
+            # 获取列表中的第一个（也是唯一的）潜在表示
+            video_latents = video_latents_list[0]
+            # 添加批次维度
+            video_latents = video_latents.unsqueeze(0)  # [1, C, T, H, W]
 
         # 处理文本提示
         device = torch.device("cpu") if self.t5_cpu else self.device

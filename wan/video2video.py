@@ -272,20 +272,17 @@ class WanV2V:
             sampler = FlowUniPCMultistepScheduler(
                 num_train_timesteps=self.config.num_train_timesteps,
                 prediction_type='flow_prediction',
-                use_flow_sigmas=True,
-                flow_shift=shift,
+                shift=shift,
             )
         else:
             # 使用DPM采样器
             sampler = FlowDPMSolverMultistepScheduler(
                 num_train_timesteps=self.config.num_train_timesteps,
                 prediction_type='flow_prediction',
-                use_flow_sigmas=True,
-                flow_shift=shift,
+                shift=shift,
                 solver_order=2,
-                beta_start=0.00085,
-                beta_end=0.012,
-                clip_sample=False,
+                algorithm_type="dpmsolver++",
+                solver_type="midpoint",
             )
 
         # 计算采样时间步长

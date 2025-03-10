@@ -551,7 +551,7 @@ def generate(args):
         
         from wan.video2video import WanV2V
         model = WanV2V(config=cfg,
-                     ckpt_dir=args.ckpt_dir,
+                     checkpoint_dir=args.ckpt_dir,
                      device_id=device,
                      rank=rank,
                      t5_cpu=args.t5_cpu,

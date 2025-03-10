@@ -324,8 +324,17 @@ class WanV2V:
                 
                 if isinstance(model, torch.nn.parallel.DistributedDataParallel):
                     # 从视频的第一帧提取 CLIP 特征
-                    first_frame = video_tensor[:, 0]  # [B, C, H, W]
-                    clip_features = self.clip.visual([first_frame])
+                    # 注意：video_tensor 的形状为 [B, T, C, H, W]
+                    # 我们需要提取第一帧并将其转为 [C, H, W] 形状
+                    first_frame = video_tensor[0, 0]  # 提取第一个批次的第一帧 [C, H, W]
+                    # 使用尺寸为 CLIP 模型所需的 224x224
+                    resized_frame = torch.nn.functional.interpolate(
+                        first_frame.unsqueeze(0),  # 添加批次维度 [1, C, H, W]
+                        size=(224, 224),
+                        mode='bicubic',
+                        align_corners=False
+                    ).squeeze(0)  # 移除批次维度，得到 [C, H, W]
+                    clip_features = self.clip.visual([resized_frame])
                     
                     model_output = torch.utils.checkpoint.checkpoint(
                         model.module.forward,
@@ -338,8 +347,17 @@ class WanV2V:
                     )
                 else:
                     # 从视频的第一帧提取 CLIP 特征
-                    first_frame = video_tensor[:, 0]  # [B, C, H, W]
-                    clip_features = self.clip.visual([first_frame])
+                    # 注意：video_tensor 的形状为 [B, T, C, H, W]
+                    # 我们需要提取第一帧并将其转为 [C, H, W] 形状
+                    first_frame = video_tensor[0, 0]  # 提取第一个批次的第一帧 [C, H, W]
+                    # 使用尺寸为 CLIP 模型所需的 224x224
+                    resized_frame = torch.nn.functional.interpolate(
+                        first_frame.unsqueeze(0),  # 添加批次维度 [1, C, H, W]
+                        size=(224, 224),
+                        mode='bicubic',
+                        align_corners=False
+                    ).squeeze(0)  # 移除批次维度，得到 [C, H, W]
+                    clip_features = self.clip.visual([resized_frame])
                     
                     model_output = torch.utils.checkpoint.checkpoint(
                         model.forward,

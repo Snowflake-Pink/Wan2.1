@@ -315,6 +315,7 @@ class WanV2V:
                         latent_model_input,
                         text_embeds.repeat(2, 1, 1) if neg_text_embeds is not None else text_embeds,
                         model_t,
+                        self.config.text_len,
                     )
                 else:
                     model_output = torch.utils.checkpoint.checkpoint(
@@ -322,6 +323,7 @@ class WanV2V:
                         latent_model_input,
                         text_embeds.repeat(2, 1, 1) if neg_text_embeds is not None else text_embeds,
                         model_t,
+                        self.config.text_len,
                     )
                 
                 # 分类器引导处理

@@ -301,8 +301,7 @@ def generate(args):
                            t5_cpu=args.t5_cpu,
                            t5_fsdp=args.t5_fsdp,
                            dit_fsdp=args.dit_fsdp,
-                           use_usp=args.ulysses_size > 1 or args.ring_size > 1,
-                           t5_cpu=args.t5_cpu)
+                           use_usp=args.ulysses_size > 1 or args.ring_size > 1)
         else:
             from xfuser.third_party.wan import WanT2V
             model = WanT2V.from_pretrained(

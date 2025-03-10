@@ -316,8 +316,17 @@ class WanV2V:
                 self.text_encoder.model.cpu()
 
         # 编码视频 - 分批处理以减少显存使用
-        # 将VAE移到GPU
-        self.vae.to(self.device)
+        # 检查WanVAE是否有model属性，如果有，移动该model
+        if hasattr(self.vae, 'model'):
+            self.vae.model.to(self.device)
+        # 也可能有encoder和decoder属性
+        if hasattr(self.vae, 'encoder'):
+            self.vae.encoder.to(self.device)
+        if hasattr(self.vae, 'decoder'):
+            self.vae.decoder.to(self.device)
+        # 或者，如果WanVAE具有自定义的device属性
+        if hasattr(self.vae, 'device'):
+            self.vae.device = self.device
         
         # 分批编码视频以减少显存使用
         batch_size = 4  # 可以根据显存大小调整
@@ -345,7 +354,12 @@ class WanV2V:
         
         # 如果启用了offload_model，将VAE移回CPU
         if offload_model:
-            self.vae.cpu()
+            if hasattr(self.vae, 'model'):
+                self.vae.model.cpu()
+            if hasattr(self.vae, 'encoder'):
+                self.vae.encoder.cpu()
+            if hasattr(self.vae, 'decoder'):
+                self.vae.decoder.cpu()
             torch.cuda.empty_cache()
         
         # 基于降噪强度添加噪声
@@ -462,7 +476,12 @@ class WanV2V:
                 torch.cuda.empty_cache()
             
             # 将VAE移到GPU进行解码
-            self.vae.to(self.device)
+            if hasattr(self.vae, 'model'):
+                self.vae.model.to(self.device)
+            if hasattr(self.vae, 'encoder'):
+                self.vae.encoder.to(self.device)
+            if hasattr(self.vae, 'decoder'):
+                self.vae.decoder.to(self.device)
             
             # 分批解码以减少显存使用
             video_chunks = []
@@ -484,7 +503,12 @@ class WanV2V:
             
             # 将所有模型卸载到CPU
             if offload_model:
-                self.vae.cpu()
+                if hasattr(self.vae, 'model'):
+                    self.vae.model.cpu()
+                if hasattr(self.vae, 'encoder'):
+                    self.vae.encoder.cpu()
+                if hasattr(self.vae, 'decoder'):
+                    self.vae.decoder.cpu()
                 if not self.dit_fsdp:
                     self.model.cpu()
                 if not self.t5_fsdp:

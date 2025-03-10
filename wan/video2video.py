@@ -266,16 +266,19 @@ class WanV2V:
         if not isinstance(self.model, torch.nn.parallel.DistributedDataParallel):
             self.model = self.model.to(self.device)
         
-        # 修改模型类型，因为我们正在执行 v2v 任务，但使用的是 i2v 模型
-        if isinstance(self.model, torch.nn.parallel.DistributedDataParallel):
-            if hasattr(self.model.module, 'model_type') and self.model.module.model_type == 'i2v':
-                logging.info("检测到 I2V 模型（DDP），修改 model_type 为 't2v' 以支持视频到视频任务")
-                self.model.module.model_type = 't2v'
-        else:
-            if hasattr(self.model, 'model_type') and self.model.model_type == 'i2v':
-                logging.info("检测到 I2V 模型，修改 model_type 为 't2v' 以支持视频到视频任务")
-                self.model.model_type = 't2v'
-
+        # 尝试修改模型类型以解决断言错误（此代码可能在某些情况下不起作用）
+        try:
+            if isinstance(self.model, torch.nn.parallel.DistributedDataParallel):
+                if hasattr(self.model.module, 'model_type') and self.model.module.model_type == 'i2v':
+                    logging.info("尝试修改 I2V 模型（DDP）的 model_type 为 't2v'")
+                    self.model.module.model_type = 't2v'
+            else:
+                if hasattr(self.model, 'model_type') and self.model.model_type == 'i2v':
+                    logging.info("尝试修改 I2V 模型的 model_type 为 't2v'")
+                    self.model.model_type = 't2v'
+        except Exception as e:
+            logging.warning(f"修改模型类型失败: {e}，将提供必要的参数以解决断言错误")
+        
         # 设置采样器
         if sample_solver == 'unipc':
             # 使用UniPC采样器
@@ -320,20 +323,32 @@ class WanV2V:
                 latent_model_input = torch.cat([latents] * 2) if neg_text_embeds is not None else latents
                 
                 if isinstance(model, torch.nn.parallel.DistributedDataParallel):
+                    # 从视频的第一帧提取 CLIP 特征
+                    first_frame = video_tensor[:, 0]  # [B, C, H, W]
+                    clip_features = self.clip.visual([first_frame])
+                    
                     model_output = torch.utils.checkpoint.checkpoint(
                         model.module.forward,
                         latent_model_input,  # x
                         model_t,  # t
                         text_embeds.repeat(2, 1, 1) if neg_text_embeds is not None else text_embeds,  # context
                         self.config.text_len,  # seq_len
+                        clip_features,  # clip_fea
+                        init_latents,  # y (使用初始潜在表示作为条件输入)
                     )
                 else:
+                    # 从视频的第一帧提取 CLIP 特征
+                    first_frame = video_tensor[:, 0]  # [B, C, H, W]
+                    clip_features = self.clip.visual([first_frame])
+                    
                     model_output = torch.utils.checkpoint.checkpoint(
                         model.forward,
                         latent_model_input,  # x
                         model_t,  # t
                         text_embeds.repeat(2, 1, 1) if neg_text_embeds is not None else text_embeds,  # context
                         self.config.text_len,  # seq_len
+                        clip_features,  # clip_fea
+                        init_latents,  # y (使用初始潜在表示作为条件输入)
                     )
                 
                 # 分类器引导处理

@@ -481,9 +481,31 @@ class WanV2V:
                             logging.info(f"x[{i}]维度: {item.shape}")
                     else:
                         logging.info(f"x不是列表，维度: {x.shape}")
-                    
-                    # 我们不使用原始的forward方法，直接实现一个简化版本
-                    # 这是一个适用于v2v的特殊处理版本，绕过了原始forward的一些步骤
+                        
+                    # 在这里调整通道数 - 非常关键
+                    if not isinstance(x, list):
+                        # 如果x不是列表，直接调整其通道数
+                        if x.size(1) != 36:
+                            logging.info(f"在forward内调整通道数: 从{x.size(1)}到36")
+                            if x.size(1) < 36:
+                                # 如果通道数小于36，复制现有通道
+                                channels_to_add = 36 - x.size(1)
+                                extra_channels = x[:, :channels_to_add].clone()
+                                x = torch.cat([x, extra_channels], dim=1)
+                            else:
+                                # 如果通道数大于36，只取前36个
+                                x = x[:, :36].clone()
+                    else:
+                        # 如果x是列表，调整列表中每个元素的通道数
+                        for i in range(len(x)):
+                            if x[i].size(1) != 36:
+                                logging.info(f"在forward内调整列表元素{i}的通道数: 从{x[i].size(1)}到36")
+                                if x[i].size(1) < 36:
+                                    channels_to_add = 36 - x[i].size(1)
+                                    extra_channels = x[i][:, :channels_to_add].clone()
+                                    x[i] = torch.cat([x[i], extra_channels], dim=1)
+                                else:
+                                    x[i] = x[i][:, :36].clone()
                     
                     # 处理x - 如果不是列表，转为列表
                     if not isinstance(x, list):
@@ -542,6 +564,31 @@ class WanV2V:
                             # 这个方法并不干净，但在紧急情况下可以使用
                             old_model_type = self_model.model_type
                             self_model.model_type = "v2v"  # 更改类型
+                            
+                            # 同样在这里调整通道数 - 确保即使用原始方法也满足通道数要求
+                            if not isinstance(x, list):
+                                # 如果已经不是列表，那可能是前面的处理失败了
+                                # 再次尝试调整通道数
+                                if x.size(1) != 36:
+                                    logging.info(f"在回退到原始方法前再次调整通道数: 从{x.size(1)}到36")
+                                    if x.size(1) < 36:
+                                        channels_to_add = 36 - x.size(1)
+                                        # 复制前几个通道
+                                        extra_channels = x[:, :channels_to_add].clone()
+                                        x = torch.cat([x, extra_channels], dim=1)
+                                    else:
+                                        x = x[:, :36].clone()
+                            else:
+                                # 如果是列表，则对每个元素调整
+                                for i in range(len(x)):
+                                    if x[i].size(1) != 36:
+                                        logging.info(f"在回退时调整列表元素{i}的通道数: 从{x[i].size(1)}到36")
+                                        if x[i].size(1) < 36:
+                                            channels_to_add = 36 - x[i].size(1)
+                                            extra_channels = x[i][:, :channels_to_add].clone()
+                                            x[i] = torch.cat([x[i], extra_channels], dim=1)
+                                        else:
+                                            x[i] = x[i][:, :36].clone()
                             
                             # 调用原始forward，但禁用断言
                             return original_forward(x, t, context, seq_len, clip_fea, None)

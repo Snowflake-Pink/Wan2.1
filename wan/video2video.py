@@ -468,7 +468,21 @@ class WanV2V:
                         ],
                         context_mask=None).sample
                 elif len(context) >= 3 and len(context_null) >= 3:
-                    # 原始方式，使用三个元素
+                    # 修复掩码维度不匹配问题
+                    null_mask = context_null[2]
+                    cond_mask = context[2]
+                    
+                    # 检查两个掩码的维度是否匹配
+                    if null_mask.size(1) != cond_mask.size(1):
+                        # 记录原始维度
+                        logging.info(f"掩码维度不匹配: null_mask={null_mask.size()}, cond_mask={cond_mask.size()}")
+                        
+                        # 方案1: 重新创建掩码 - 对两个提示编码使用全1掩码
+                        null_tensor = context_null[0]
+                        cond_tensor = context[0]
+                        null_mask = torch.ones((1, null_tensor.size(0)), dtype=torch.bool, device=self.device)
+                        cond_mask = torch.ones((1, cond_tensor.size(0)), dtype=torch.bool, device=self.device)
+                    
                     noise_pred = self.model(
                         input_latents=latent_model_input,
                         timestep=t,
@@ -476,9 +490,7 @@ class WanV2V:
                             torch.cat([context_null[0], context[0]]),
                             torch.cat([context_null[1], context[1]])
                         ],
-                        context_mask=torch.cat([
-                            context_null[2], context[2]
-                        ])).sample
+                        context_mask=torch.cat([null_mask, cond_mask])).sample
                 elif len(context) >= 2 and len(context_null) >= 2:
                     # 使用两个元素但没有mask
                     noise_pred = self.model(

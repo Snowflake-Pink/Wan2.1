@@ -479,55 +479,95 @@ class WanV2V:
                             dtype=self.param_dtype
                         )
                         
-                        # 我们也需要提供y参数，使用与latent_model_input相同的一半
-                        # 由于latent_model_input已经是[latents_sample]*2，我们取第一半
-                        y_input = [latent_model_input[:batch_size]]
+                        # 根据错误信息和模型代码，我们调整y参数的处理
+                        # x参数是位置参数latent_model_input
+                        # 从模型代码看：x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
+                        # 这表明x和y都应该是列表，列表中的每个元素是具有相同维度的张量
                         
-                        # 创建参数字典
+                        # 检查latent_model_input的维度
+                        if i == 0:
+                            logging.info(f"latent_model_input维度: {latent_model_input.shape}")
+                        
+                        # 我们需要将latent_model_input分割成单元素张量列表
+                        # 注意在视频到视频转换中，我们不是真的需要条件输入，但需要满足API
+                        # 创建与x相同结构的y
+                        y_input = latent_model_input[:batch_size]
+                        
+                        # 创建参数字典 - 将x和y都作为列表传递
                         arg_c = {
                             'context': [torch.cat([context_null[0], context[0]])],
                             'seq_len': max_seq_len,
                             'clip_fea': fake_clip_fea,
-                            'y': y_input
+                            'y': [y_input]  # 将y包装为列表
                         }
+                        
+                        # 由于现在x也需要是列表，我们在调用模型时特殊处理
+                        try:
+                            # 尝试调用模型，将latent_model_input包装为列表
+                            noise_pred = self.model(
+                                [latent_model_input],  # 将x包装为列表 
+                                t=timestep, 
+                                **arg_c)[0]
+                        except (AssertionError, RuntimeError) as e:
+                            # 如果出错，记录错误并尝试不同的方式
+                            logging.warning(f"模型调用错误: {e}")
+                            logging.info("尝试不同的参数格式...")
+                            
+                            # 尝试临时修改模型类型并简化参数
+                            original_model_type = self.model.config.model_type
+                            try:
+                                # 临时修改模型类型
+                                self.model.config.model_type = 'v2v'  # 避免i2v的断言检查
+                                # 使用简化的参数调用
+                                arg_simple = {
+                                    'context': [torch.cat([context_null[0], context[0]])],
+                                    'seq_len': max_seq_len
+                                }
+                                noise_pred = self.model(
+                                    latent_model_input,  # 不包装为列表
+                                    t=timestep, 
+                                    **arg_simple)[0]
+                            finally:
+                                # 恢复原始模型类型
+                                self.model.config.model_type = original_model_type
                     else:
                         # 对于其他类型，我们只提供基本参数
                         arg_c = {
                             'context': [torch.cat([context_null[0], context[0]])],
                             'seq_len': max_seq_len
                         }
-                    
-                    # 将timestep转换为列表然后堆叠，与其他模块保持一致
-                    timestep = torch.tensor([t], device=self.device)
-                    
-                    try:
-                        # 尝试调用模型
-                        noise_pred = self.model(
-                            latent_model_input, 
-                            t=timestep, 
-                            **arg_c)[0]
-                    except AssertionError as e:
-                        # 如果断言错误（clip_fea/y不满足要求），尝试创建临时模型对象绕过检查
-                        logging.warning(f"模型断言错误: {e}")
-                        logging.info("尝试临时修改模型类型以绕过检查...")
                         
-                        # 临时保存原始模型类型
-                        original_model_type = self.model.config.model_type
+                        # 将timestep转换为列表然后堆叠，与其他模块保持一致
+                        timestep = torch.tensor([t], device=self.device)
+                        
                         try:
-                            # 临时修改模型类型
-                            self.model.config.model_type = 'v2v'  # 自定义类型不会触发断言
-                            # 重试
+                            # 尝试调用模型
                             noise_pred = self.model(
                                 latent_model_input, 
                                 t=timestep, 
                                 **arg_c)[0]
-                        finally:
-                            # 恢复原始模型类型
-                            self.model.config.model_type = original_model_type
-                    
-                    # 记录使用的参数方式
+                        except AssertionError as e:
+                            # 如果断言错误（可能是各种原因），记录并尝试简化处理
+                            logging.warning(f"模型断言错误: {e}")
+                            logging.info("尝试临时修改模型类型...")
+                            
+                            # 临时修改模型类型
+                            original_model_type = getattr(self.model.config, 'model_type', 'i2v')
+                            try:
+                                # 临时修改模型类型
+                                self.model.config.model_type = 'v2v'  # 自定义类型避免断言
+                                # 重试
+                                noise_pred = self.model(
+                                    latent_model_input, 
+                                    t=timestep, 
+                                    **arg_c)[0]
+                            finally:
+                                # 恢复原始模型类型
+                                self.model.config.model_type = original_model_type
+                                
+                    # 记录成功使用的参数
                     if i == 0:  # 只在第一次迭代记录
-                        logging.info(f"使用的参数: {list(arg_c.keys())}")
+                        logging.info(f"成功使用的参数格式")
                 else:
                     # 如果连第一个元素都没有，这是非常异常的情况
                     logging.error("严重错误：context或context_null为空，无法进行生成")

@@ -460,13 +460,19 @@ class WanV2V:
                 # 由于掩码尺寸不匹配问题，我们完全不使用掩码，改为全部使用context_mask=None的方式处理
                 if len(context) >= 1 and len(context_null) >= 1:
                     # 确保至少有一个元素可以连接
+                    # 创建参数字典，与其他模块使用相同的调用方式
+                    arg_c = {
+                        "context": [torch.cat([context_null[0], context[0]])],
+                        "context_mask": None
+                    }
+                    
+                    # 将timestep转换为列表然后堆叠，与其他模块保持一致
+                    timestep = torch.tensor([t], device=self.device)
+                    
                     noise_pred = self.model(
-                        input_latents=latent_model_input,
-                        timestep=t,
-                        context=[
-                            torch.cat([context_null[0], context[0]])
-                        ],
-                        context_mask=None).sample
+                        latent_model_input, 
+                        t=timestep, 
+                        **arg_c)[0]  # 使用索引[0]访问第一个元素，而不是.sample属性
                     
                     # 记录使用了无掩码方式
                     if i == 0:  # 只在第一次迭代记录

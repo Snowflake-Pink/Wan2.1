@@ -463,7 +463,7 @@ class WanV2V:
                     # 创建参数字典，与其他模块使用相同的调用方式
                     arg_c = {
                         "context": [torch.cat([context_null[0], context[0]])],
-                        "context_mask": None
+                        "seq_len": max_seq_len  # 使用前面定义的max_seq_len
                     }
                     
                     # 将timestep转换为列表然后堆叠，与其他模块保持一致

@@ -457,9 +457,9 @@ class WanV2V:
                 latent_model_input = torch.cat([latents_sample] * 2)
                 
                 # 预测噪声残差
-                # 修复context索引问题，检查context列表长度
-                if len(context) == 1 and len(context_null) == 1:
-                    # 如果context只有一个元素，直接使用它
+                # 由于掩码尺寸不匹配问题，我们完全不使用掩码，改为全部使用context_mask=None的方式处理
+                if len(context) >= 1 and len(context_null) >= 1:
+                    # 确保至少有一个元素可以连接
                     noise_pred = self.model(
                         input_latents=latent_model_input,
                         timestep=t,
@@ -467,49 +467,14 @@ class WanV2V:
                             torch.cat([context_null[0], context[0]])
                         ],
                         context_mask=None).sample
-                elif len(context) >= 3 and len(context_null) >= 3:
-                    # 修复掩码维度不匹配问题
-                    null_mask = context_null[2]
-                    cond_mask = context[2]
                     
-                    # 检查两个掩码的维度是否匹配
-                    if null_mask.size(1) != cond_mask.size(1):
-                        # 记录原始维度
-                        logging.info(f"掩码维度不匹配: null_mask={null_mask.size()}, cond_mask={cond_mask.size()}")
-                        
-                        # 方案1: 重新创建掩码 - 对两个提示编码使用全1掩码
-                        null_tensor = context_null[0]
-                        cond_tensor = context[0]
-                        null_mask = torch.ones((1, null_tensor.size(0)), dtype=torch.bool, device=self.device)
-                        cond_mask = torch.ones((1, cond_tensor.size(0)), dtype=torch.bool, device=self.device)
-                    
-                    noise_pred = self.model(
-                        input_latents=latent_model_input,
-                        timestep=t,
-                        context=[
-                            torch.cat([context_null[0], context[0]]),
-                            torch.cat([context_null[1], context[1]])
-                        ],
-                        context_mask=torch.cat([null_mask, cond_mask])).sample
-                elif len(context) >= 2 and len(context_null) >= 2:
-                    # 使用两个元素但没有mask
-                    noise_pred = self.model(
-                        input_latents=latent_model_input,
-                        timestep=t,
-                        context=[
-                            torch.cat([context_null[0], context[0]]),
-                            torch.cat([context_null[1], context[1]])
-                        ],
-                        context_mask=None).sample
+                    # 记录使用了无掩码方式
+                    if i == 0:  # 只在第一次迭代记录
+                        logging.info("使用无掩码方式进行去噪生成")
                 else:
-                    # 兜底方案，仅使用第一个元素
-                    noise_pred = self.model(
-                        input_latents=latent_model_input,
-                        timestep=t,
-                        context=[
-                            torch.cat([context_null[0], context[0]])
-                        ],
-                        context_mask=None).sample
+                    # 如果连第一个元素都没有，这是非常异常的情况
+                    logging.error("严重错误：context或context_null为空，无法进行生成")
+                    raise ValueError("无效的context数据")
                 
                 # 执行调节
                 noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)

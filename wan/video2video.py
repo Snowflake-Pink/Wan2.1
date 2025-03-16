@@ -565,6 +565,22 @@ class WanV2V:
                 # 在每个去噪步骤中，获取调节
                 latent_model_input = torch.cat([latents_sample] * 2)
                 
+                # 调整通道数 - 重要解决方案
+                # 模型期望36通道，但我们的输入是32通道，需要调整
+                if latent_model_input.size(1) != 36:
+                    if latent_model_input.size(1) < 36:
+                        # 如果通道数小于36，我们复制现有通道直到达到36个
+                        channels_to_add = 36 - latent_model_input.size(1)
+                        # 复制前几个通道作为补充
+                        extra_channels = latent_model_input[:, :channels_to_add].clone()
+                        latent_model_input = torch.cat([latent_model_input, extra_channels], dim=1)
+                    else:
+                        # 如果通道数大于36，我们只取前36个通道
+                        latent_model_input = latent_model_input[:, :36]
+                    
+                    if i == 0:
+                        logging.info(f"调整后的输入维度: {latent_model_input.shape}")
+                
                 # 将timestep转换为张量，与其他模块保持一致 - 在分支之前就定义
                 timestep = torch.tensor([t], device=self.device)
                 

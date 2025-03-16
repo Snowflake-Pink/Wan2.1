@@ -456,6 +456,9 @@ class WanV2V:
                 # 在每个去噪步骤中，获取调节
                 latent_model_input = torch.cat([latents_sample] * 2)
                 
+                # 将timestep转换为张量，与其他模块保持一致 - 在分支之前就定义
+                timestep = torch.tensor([t], device=self.device)
+                
                 # 预测噪声残差
                 # 由于掩码尺寸不匹配问题，我们完全不使用掩码，改为使用与其他模块一致的参数
                 if len(context) >= 1 and len(context_null) >= 1:
@@ -537,8 +540,7 @@ class WanV2V:
                             'seq_len': max_seq_len
                         }
                         
-                        # 将timestep转换为列表然后堆叠，与其他模块保持一致
-                        timestep = torch.tensor([t], device=self.device)
+                        # 不需要再次定义timestep，已经在前面定义过了
                         
                         try:
                             # 尝试调用模型

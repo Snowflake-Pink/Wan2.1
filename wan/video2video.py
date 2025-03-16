@@ -314,7 +314,24 @@ class WanV2V:
             context_null = self.text_encoder([n_prompt], self.device)
             if offload_model and not self.t5_fsdp:
                 self.text_encoder.model.cpu()
-
+                
+        # 修复：确保context和context_null是兼容的格式
+        # T5EncoderModel.__call__方法只返回一个元素，我们需要转换成WanModel期望的格式
+        # 检查context是否为列表且只包含一个元素
+        if isinstance(context, list) and len(context) == 1 and isinstance(context[0], torch.Tensor):
+            # 创建适用于WanModel的格式
+            context_tensor = context[0]
+            context_mask = torch.ones((1, context_tensor.size(0)), dtype=torch.bool, device=self.device)
+            # 转换为[tensor, tensor, mask]格式
+            context = [context_tensor, context_tensor, context_mask]
+            
+        if isinstance(context_null, list) and len(context_null) == 1 and isinstance(context_null[0], torch.Tensor):
+            # 对context_null做同样的处理
+            context_null_tensor = context_null[0]
+            context_null_mask = torch.ones((1, context_null_tensor.size(0)), dtype=torch.bool, device=self.device)
+            # 转换为[tensor, tensor, mask]格式
+            context_null = [context_null_tensor, context_null_tensor, context_null_mask]
+        
         # 编码视频 - 分批处理以减少显存使用
         # 检查WanVAE是否有model属性，如果有，移动该model
         if hasattr(self.vae, 'model'):
@@ -440,16 +457,47 @@ class WanV2V:
                 latent_model_input = torch.cat([latents_sample] * 2)
                 
                 # 预测噪声残差
-                noise_pred = self.model(
-                    input_latents=latent_model_input,
-                    timestep=t,
-                    context=[
-                        torch.cat([context_null[0], context[0]]),
-                        torch.cat([context_null[1], context[1]])
-                    ],
-                    context_mask=torch.cat([
-                        context_null[2], context[2]
-                    ])).sample
+                # 修复context索引问题，检查context列表长度
+                if len(context) == 1 and len(context_null) == 1:
+                    # 如果context只有一个元素，直接使用它
+                    noise_pred = self.model(
+                        input_latents=latent_model_input,
+                        timestep=t,
+                        context=[
+                            torch.cat([context_null[0], context[0]])
+                        ],
+                        context_mask=None).sample
+                elif len(context) >= 3 and len(context_null) >= 3:
+                    # 原始方式，使用三个元素
+                    noise_pred = self.model(
+                        input_latents=latent_model_input,
+                        timestep=t,
+                        context=[
+                            torch.cat([context_null[0], context[0]]),
+                            torch.cat([context_null[1], context[1]])
+                        ],
+                        context_mask=torch.cat([
+                            context_null[2], context[2]
+                        ])).sample
+                elif len(context) >= 2 and len(context_null) >= 2:
+                    # 使用两个元素但没有mask
+                    noise_pred = self.model(
+                        input_latents=latent_model_input,
+                        timestep=t,
+                        context=[
+                            torch.cat([context_null[0], context[0]]),
+                            torch.cat([context_null[1], context[1]])
+                        ],
+                        context_mask=None).sample
+                else:
+                    # 兜底方案，仅使用第一个元素
+                    noise_pred = self.model(
+                        input_latents=latent_model_input,
+                        timestep=t,
+                        context=[
+                            torch.cat([context_null[0], context[0]])
+                        ],
+                        context_mask=None).sample
                 
                 # 执行调节
                 noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
